@@ -67,3 +67,5 @@ Icon
 # Backup files
 *.bak
 *.backup
+# Node.js
+node_modules/
