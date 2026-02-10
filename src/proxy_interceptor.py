@@ -311,33 +311,18 @@ class ProxyRequestHandler(http.server.BaseHTTPRequestHandler):
 
         conns = [self.connection, remote]
         keep = True
-        try:
-            while keep:
-                rlist, _, xlist = select.select(conns, [], conns, 30)
-                if xlist:
+        while keep:
+            rlist, _, xlist = select.select(conns, [], conns, 30)
+            if xlist:
+                break
+            for r in rlist:
+                data = r.recv(65536)
+                if not data:
+                    keep = False
                     break
-                for r in rlist:
-                    try:
-                        data = r.recv(65536)
-                    except (ConnectionResetError, BrokenPipeError, OSError):
-                        keep = False
-                        break
-                    if not data:
-                        keep = False
-                        break
-                    other = remote if r is self.connection else self.connection
-                    try:
-                        other.sendall(data)
-                    except (ConnectionResetError, BrokenPipeError, OSError):
-                        keep = False
-                        break
-        except Exception:
-            pass
-        finally:
-            try:
-                remote.close()
-            except Exception:
-                pass
+                other = remote if r is self.connection else self.connection
+                other.sendall(data)
+        remote.close()
 
     # ── Plain HTTP requests (GET / POST / …) ─────────────────────────────────
 

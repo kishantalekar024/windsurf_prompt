@@ -13,6 +13,7 @@ import struct
 import threading
 import json
 import os
+import re
 from datetime import datetime
 from typing import Optional, Callable
 
@@ -26,19 +27,36 @@ console = Console()
 class LocalSniffer:
     """Sniffs HTTP traffic on loopback to capture Windsurf's local API calls."""
 
-    # The endpoint we're looking for
-    TARGET_ENDPOINT = b"SendUserCascadeMessage"
-    TARGET_SERVICE = b"LanguageServerService"
+    # The endpoints we're looking for - using regex for flexibility
+    TARGET_ENDPOINT_PATTERN = re.compile(rb"SendUserCascadeMessage")
+    TARGET_SERVICE_PATTERN = re.compile(rb"LanguageServerService")
+    TARGET_HOST_PATTERN = re.compile(rb"[a-z]\.localhost")
 
-    def __init__(self, on_prompt: Optional[Callable[[InterceptedPrompt], None]] = None):
+    def __init__(
+        self,
+        on_prompt: Optional[Callable[[InterceptedPrompt], None]] = None,
+        db=None,
+        debug: bool = False,
+    ):
         self.parser = PromptParser()
         self.on_prompt = on_prompt
+        self.db = db  # MongoDB instance
+        self.debug = debug  # Enable debug logging
         self._proc: Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
         # Buffer to accumulate payload data across multiple packets
-        # keyed by (src_port, dst_port) tuple
+        # keyed by (src_port, dst_port, seq_start) tuple to handle connection reuse
         self._stream_buffers: dict = {}
+        # Track known language server ports — once identified, capture ALL traffic to them
+        self._known_ls_ports: set = set()
+        # Track sequence numbers for better stream identification
+        self._stream_sequences: dict = {}
+        # Debug counters
+        self._packet_count = 0
+        self._processed_payload_count = 0
+        self._prompt_count = 0
+        self._extraction_attempts = 0
 
     def start(self):
         """Start sniffing loopback traffic in a background thread."""
@@ -131,9 +149,20 @@ class LocalSniffer:
                     break
 
                 packet_count += 1
+                self._packet_count += 1
 
                 # Parse the packet to extract TCP payload
                 self._parse_packet(pkt_data, link_type, endian)
+                
+                # Debug output every 100 packets
+                if self.debug and packet_count % 100 == 0:
+                    console.print(
+                        f"[dim]Debug: Processed {packet_count} packets, "
+                        f"{self._processed_payload_count} payloads, "
+                        f"{self._extraction_attempts} extraction attempts, "
+                        f"{self._prompt_count} prompts, "
+                        f"{len(self._stream_buffers)} active buffers[/dim]"
+                    )
 
         except FileNotFoundError:
             console.print("[red]tcpdump not found. Is it in your PATH?[/red]")
@@ -226,17 +255,42 @@ class LocalSniffer:
 
     def _process_payload(self, payload: bytes, src_port: int, dst_port: int):
         """Process TCP payload, buffering and looking for Windsurf requests."""
-        # Quick check: does this payload contain our target endpoint?
-        has_target = (
-            self.TARGET_ENDPOINT in payload or
-            self.TARGET_SERVICE in payload
+        self._processed_payload_count += 1
+        
+        # Check if this packet has explicit target markers
+        has_url_target = bool(
+            self.TARGET_ENDPOINT_PATTERN.search(payload) or
+            self.TARGET_SERVICE_PATTERN.search(payload) or
+            self.TARGET_HOST_PATTERN.search(payload)
         )
+
+        # If we see the URL target, remember this destination port as a language server
+        if has_url_target:
+            self._known_ls_ports.add(dst_port)
+            if self.debug:
+                console.print(f"[dim]Debug: Found LS port {dst_port}[/dim]")
+
+        # Decide whether to buffer this packet:
+        # 1. Has explicit target markers (URL or body)
+        # 2. Destination is a known language server port (learned from first request)
+        # 3. Already tracking this stream
+        # Trigger buffering if we see ANY strong Windsurf marker
+        has_body_target = (
+            b'"cascadeId"' in payload or 
+            b'"items"' in payload or
+            b"LanguageServerService" in payload
+        )
+        is_known_port = dst_port in self._known_ls_ports
 
         stream_key = (src_port, dst_port)
 
-        if has_target:
-            # This packet starts or contains our target request
-            # Store/append to buffer
+        should_buffer = has_url_target or has_body_target or is_known_port
+        
+        if self.debug and (has_url_target or has_body_target):
+            console.print(f"[dim]Debug: Buffering packet {src_port}→{dst_port}, "
+                         f"url_target={has_url_target}, body_target={has_body_target}[/dim]")
+
+        if should_buffer:
             if stream_key in self._stream_buffers:
                 self._stream_buffers[stream_key] += payload
             else:
@@ -245,107 +299,305 @@ class LocalSniffer:
             # Continue buffering a stream we're already tracking
             self._stream_buffers[stream_key] += payload
 
-            # Safety limit: don't buffer more than 1MB
-            if len(self._stream_buffers[stream_key]) > 1024 * 1024:
-                del self._stream_buffers[stream_key]
+        # Safety limit: don't buffer more than 5MB - but keep some data for debugging
+        if stream_key in self._stream_buffers:
+            if len(self._stream_buffers[stream_key]) > 5 * 1024 * 1024:
+                # Log this event for debugging
+                console.print(f"[yellow]⚠️ Buffer overflow for stream {src_port}→{dst_port}, resetting[/yellow]")
+                # Keep only the last 256KB in case the JSON spans the boundary
+                self._stream_buffers[stream_key] = self._stream_buffers[stream_key][-262144:]
                 return
 
         # Try to extract and process complete JSON from buffered data
         if stream_key in self._stream_buffers:
             buf = self._stream_buffers[stream_key]
-            result = self._try_extract_request(buf)
-            if result is not None:
-                # Successfully extracted — remove from buffer
-                del self._stream_buffers[stream_key]
+            
+            # Debug: Log buffer contents for failed extractions
+            if self.debug and len(buf) > 100:  # Only log substantial buffers
+                preview = buf[:200].decode('utf-8', errors='replace').replace('\n', '\\n').replace('\r', '\\r')
+                console.print(f"[dim]Debug: Attempting extraction from buffer {src_port}→{dst_port}, size={len(buf)}, preview: {preview[:100]}...[/dim]")
+            
+            self._extraction_attempts += 1
+            result, consumed_bytes = self._try_extract_request(buf)
+            if result is not None and consumed_bytes > 0:
+                # Successfully extracted — remove only consumed portion from buffer
+                remaining = buf[consumed_bytes:]
+                if remaining:
+                    self._stream_buffers[stream_key] = remaining
+                else:
+                    del self._stream_buffers[stream_key]
+            elif self.debug and len(buf) > 500:
+                # Debug: Log extraction failures for large buffers
+                console.print(f"[yellow]Debug: ⚠️ Failed to extract from large buffer {src_port}→{dst_port}, size={len(buf)}[/yellow]")
 
-    def _try_extract_request(self, raw_data: bytes) -> Optional[bool]:
-        """Try to extract a complete HTTP request with JSON body from raw data."""
+    def _try_extract_request(self, raw_data: bytes) -> tuple[Optional[bool], int]:
+        """Try to extract a complete HTTP request with JSON body from raw data.
+        
+        Returns:
+            tuple: (success, consumed_bytes) - consumed_bytes indicates how many bytes
+                  from the start of raw_data were processed and can be removed from buffer
+        """
         try:
             text = raw_data.decode("utf-8", errors="replace")
 
-            # Look for HTTP request line
-            # POST /exa.language_server_pb.LanguageServerService/SendUserCascadeMessage HTTP/1.1
-            if "SendUserCascadeMessage" not in text:
-                return None
-
-            # Find the JSON body (after the HTTP headers)
-            # Headers end with \r\n\r\n
+            # Strategy 1: Standard HTTP/1.1 with headers
+            # POST /...SendUserCascadeMessage HTTP/1.1\r\n...\r\n\r\n{json}
             header_end = text.find("\r\n\r\n")
-            if header_end == -1:
-                return None  # Headers not complete yet
+            if header_end != -1:
+                body_start = header_end + 4
+                body = text[body_start:]
+                if body.strip():
+                    json_str, json_end_offset = self._extract_json_with_position(body)
+                    if json_str:
+                        try:
+                            data = json.loads(json_str)
+                            if "cascadeId" in data and "items" in data:
+                                # Extract headers
+                                header_text = text[:header_end]
+                                headers = {}
+                                for line in header_text.split("\r\n")[1:]:
+                                    if ": " in line:
+                                        k, v = line.split(": ", 1)
+                                        headers[k.lower()] = v
 
-            body_start = header_end + 4
-            body = text[body_start:]
+                                url = self._extract_windsurf_url(header_text) or (
+                                    "http://localhost/"
+                                    "exa.language_server_pb.LanguageServerService/"
+                                    "SendUserCascadeMessage"
+                                )
 
-            if not body.strip():
-                return None  # Body not received yet
+                                prompt = self.parser.extract_prompt_from_request(
+                                    url, "POST", json_str, headers
+                                )
 
-            # Try to extract and parse JSON from the body
-            json_str = self._extract_json(body)
-            if not json_str:
-                return None
+                                if prompt and prompt.prompt:
+                                    self._prompt_count += 1
+                                    if self.debug:
+                                        console.print(f"[dim]Debug: ✅ Extracted prompt #{self._prompt_count} from HTTP/1.1 request[/dim]")
+                                    self._display_prompt(prompt)
+                                    self._log_to_file(prompt)
+                                    if self.on_prompt:
+                                        self.on_prompt(prompt)
+                                
+                                # Return bytes consumed: headers + body up to end of JSON
+                                consumed = body_start + json_end_offset
+                                return True, consumed
+                        except json.JSONDecodeError:
+                            # Invalid JSON, continue to strategy 2
+                            pass
 
-            data = json.loads(json_str)
+            # Strategy 2: HTTP/2 binary framing or Connect framing.
+            # Headers are HPACK-compressed or sent separately.
+            # The body is JSON, but might be prefixed with 5 bytes (gRPC/Connect framing):
+            # [1 byte flag] [4 bytes length] [JSON...]
+            
+            # Simple heuristic: scan for '{' and try to decode from there
+            if "{" in text:
+                if self.debug:
+                    console.print(f"[dim]Debug: Found {{ in text, attempting JSON extraction...[/dim]")
+                    
+                json_str, json_end_offset = self._extract_json_with_position(text)
+                if json_str:
+                    if self.debug:
+                        console.print(f"[dim]Debug: Extracted JSON of length {len(json_str)}, checking for Windsurf markers...[/dim]")
+                        
+                    try:
+                        data = json.loads(json_str)
+                        # Ensure it's a valid Windsurf message - more comprehensive check
+                        has_marker = (
+                            ("cascadeId" in data and "items" in data) or
+                            ("cascadeId" in data and "metadata" in data) or  # Single message format
+                            ("messages" in data and "model" in data) or
+                            ("cascadeId" in data)  # Most lenient - any message with cascadeId
+                        )
+                        
+                        if self.debug:
+                            console.print(f"[dim]Debug: JSON parsed successfully, has_marker={has_marker}, keys={list(data.keys())[:5]}[/dim]")
+                        
+                        if has_marker:
+                            # Try to extract the actual URL from the data or use a default
+                            url = self._extract_windsurf_url_from_data(text) or (
+                                "http://localhost/"
+                                "exa.language_server_pb.LanguageServerService/"
+                                "SendUserCascadeMessage"
+                            )
 
-            # Verify this is a Windsurf cascade message
-            if "cascadeId" not in data or "items" not in data:
-                return None
+                            prompt = self.parser.extract_prompt_from_request(
+                                url, "POST", json_str, {}
+                            )
 
-            # Extract headers from the raw HTTP
-            header_text = text[:header_end]
-            headers = {}
-            for line in header_text.split("\r\n")[1:]:  # Skip request line
-                if ": " in line:
-                    k, v = line.split(": ", 1)
-                    headers[k.lower()] = v
+                            if prompt and prompt.prompt:
+                                self._prompt_count += 1
+                                if self.debug:
+                                    console.print(f"[dim]Debug: ✅ Extracted prompt #{self._prompt_count} from HTTP/2 request[/dim]")
+                                self._display_prompt(prompt)
+                                self._log_to_file(prompt)
+                                if self.on_prompt:
+                                    self.on_prompt(prompt)
+                                return True, json_end_offset
+                            elif self.debug:
+                                console.print(f"[yellow]Debug: ⚠️ JSON parsed but no prompt extracted[/yellow]")
+                    except json.JSONDecodeError as e:
+                        if self.debug:
+                            console.print(f"[yellow]Debug: ⚠️ JSON decode error: {e}[/yellow]")
+                    except Exception as e:
+                        if self.debug:
+                            console.print(f"[yellow]Debug: ⚠️ Exception during parsing: {e}[/yellow]")
+                elif self.debug:
+                    console.print(f"[yellow]Debug: ⚠️ Found {{ but could not extract valid JSON[/yellow]")
 
-            # Use the prompt parser
-            url = (
-                "http://d.localhost/"
-                "exa.language_server_pb.LanguageServerService/"
-                "SendUserCascadeMessage"
-            )
-
-            prompt = self.parser.extract_prompt_from_request(
-                url, "POST", json_str, headers
-            )
-
-            if prompt and prompt.prompt:
-                self._display_prompt(prompt)
-                self._log_to_file(prompt)
-                if self.on_prompt:
-                    self.on_prompt(prompt)
-
-            return True
+            return None, 0
 
         except json.JSONDecodeError:
-            return None  # Incomplete JSON, keep buffering
+            return None, 0  # Incomplete JSON, keep buffering
         except Exception as e:
             console.print(f"[dim]Sniffer parse warning: {e}[/dim]")
-            return None
+            return None, 0
 
     def _extract_json(self, text: str) -> Optional[str]:
         """Extract a JSON object from mixed text."""
-        brace_depth = 0
-        start = -1
-
+        result, _ = self._extract_json_with_position(text)
+        return result
+        
+    def _extract_json_with_position(self, text: str) -> tuple[Optional[str], int]:
+        """Extract a JSON object from mixed text, returning the JSON and end position.
+        
+        Returns:
+            tuple: (json_string, end_position) - end_position is relative to start of text
+        """
+        # Find start of JSON object - try multiple strategies
+        start_indices = []
+        
+        # Strategy 1: Find all standalone '{'
         for i, ch in enumerate(text):
             if ch == "{":
-                if start == -1:
-                    start = i
-                brace_depth += 1
-            elif ch == "}":
-                brace_depth -= 1
-                if brace_depth == 0 and start != -1:
-                    candidate = text[start : i + 1]
-                    try:
-                        json.loads(candidate)
-                        return candidate
-                    except json.JSONDecodeError:
-                        start = -1
-                        brace_depth = 0
-                        continue
+                start_indices.append(i)
+        
+        # Strategy 2: Look for Connect protocol framing
+        # Connect uses: [compression_flag(1)][message_length(4)][message]
+        for i in range(0, len(text) - 6):
+            # Check for uncompressed message (flag = 0)
+            if ord(text[i]) == 0:  # Compression flag = 0
+                try:
+                    # Next 4 bytes are big-endian message length
+                    length_bytes = text[i+1:i+5].encode('latin1')[:4]
+                    if len(length_bytes) == 4:
+                        message_start = i + 5
+                        if message_start < len(text) and text[message_start] == "{":
+                            start_indices.insert(0, message_start)  # Prioritize this
+                except:
+                    pass
+                    
+        # Strategy 3: Look for gRPC-style length prefixes
+        # Common pattern: \x00\x00\x00\x[length]{json}
+        for i in range(0, len(text) - 5):
+            if i + 5 < len(text) and text[i + 5] == "{":
+                # Check if this looks like a length prefix
+                if text[i:i+3] == '\x00\x00\x00':
+                    start_indices.insert(0, i + 5)  # Prioritize this
+                    
+        # Strategy 4: Look for HTTP Content-Length
+        content_length_pos = text.find("Content-Length:")
+        if content_length_pos != -1:
+            # Find next { after Content-Length
+            search_start = content_length_pos + 15
+            brace_pos = text.find("{", search_start)
+            if brace_pos != -1:
+                start_indices.insert(0, brace_pos)  # Prioritize this
+                
+        # Strategy 5: Look for cascadeId directly (our most reliable marker)
+        cascade_pos = text.find('"cascadeId"')
+        if cascade_pos != -1:
+            # Search backwards for the opening brace
+            for j in range(cascade_pos, -1, -1):
+                if text[j] == '{':
+                    start_indices.insert(0, j)  # Highest priority
+                    break
+                    
+        if not start_indices:
+            return None, 0
+            
+        # Try from each potential start brace (prioritized order)
+        for start in start_indices:
+            result = self._extract_json_from_position(text, start)
+            if result[0]:  # If successful
+                return result
+                
+        return None, 0
+    
+    def _extract_json_from_position(self, text: str, start: int) -> tuple[Optional[str], int]:
+        """Extract JSON starting from a specific position."""
+        brace_depth = 0
+        in_string = False
+        escaped = False
+        
+        # Scan forward from this start with proper string handling
+        for i in range(start, len(text)):
+            ch = text[i]
+            
+            if not in_string:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    brace_depth += 1
+                elif ch == "}":
+                    brace_depth -= 1
+                    if brace_depth == 0:
+                        # Found a complete balanced block
+                        candidate = text[start : i + 1]
+                        try:
+                            # Additional validation: check for minimum viable JSON size
+                            if len(candidate) < 10:
+                                return None, 0  # Too small to be real JSON
+                                
+                            # Quick validation for Windsurf-specific content
+                            if 'cascadeId' not in candidate:
+                                return None, 0  # Not a Windsurf message
+                                
+                            json.loads(candidate)  # Validate JSON
+                            return candidate, i + 1
+                        except json.JSONDecodeError:
+                            # Not valid JSON
+                            return None, 0
+                        # If we get here, exit the main loop
+                        return None, 0
+            else:
+                # Inside string - handle escapes
+                if escaped:
+                    escaped = False
+                elif ch == '\\':
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                    
+        return None, 0
 
+    def _extract_windsurf_url(self, headers: str) -> Optional[str]:
+        """Extract the actual Windsurf URL from HTTP headers."""
+        # Look for Host header and reconstruct URL
+        for line in headers.split('\n'):
+            if line.lower().startswith('host:'):
+                host = line.split(':', 1)[1].strip()
+                if '.localhost' in host:
+                    return f"http://{host}/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage"
+        return None
+        
+    def _extract_windsurf_url_from_data(self, text: str) -> Optional[str]:
+        """Try to extract Windsurf URL from raw data."""
+        # Look for localhost patterns in the text
+        patterns = [
+            r'http://([a-z])\.localhost:(\d+)(/[^\s]*)?',
+            r'([a-z])\.localhost:(\d+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                if len(match.groups()) >= 2:
+                    subdomain = match.group(1)
+                    port = match.group(2)
+                    return f"http://{subdomain}.localhost:{port}/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage"
+        
         return None
 
     def _display_prompt(self, prompt: InterceptedPrompt):
@@ -396,8 +648,9 @@ class LocalSniffer:
         console.print("=" * 80)
 
     def _log_to_file(self, prompt: InterceptedPrompt):
-        """Save intercepted prompt to log file."""
+        """Save intercepted prompt to log file and MongoDB."""
         try:
+            # Save to JSONL file
             os.makedirs("logs", exist_ok=True)
             log_file = os.path.join(
                 "logs", f"prompts_{datetime.now().strftime('%Y-%m-%d')}.jsonl"
@@ -415,6 +668,25 @@ class LocalSniffer:
             }
             with open(log_file, "a") as f:
                 f.write(json.dumps(entry) + "\n")
+            
+            # Save to MongoDB if connected
+            if self.db and self.db.is_connected():
+                meta = prompt.metadata or {}
+                self.db.save_prompt(
+                    prompt_text=prompt.prompt,
+                    user="default_user",  # Hardcoded for now
+                    source=prompt.source,
+                    model=meta.get("model", ""),
+                    cascade_id=meta.get("cascade_id", ""),
+                    planner_mode=meta.get("planner_mode", ""),
+                    ide_name=meta.get("ide_name", ""),
+                    ide_version=meta.get("ide_version", ""),
+                    extension_version=meta.get("extension_version", ""),
+                    brain_enabled=meta.get("brain_enabled", False),
+                    prompt_length=len(prompt.prompt),
+                    metadata=meta,
+                    timestamp=prompt.timestamp,
+                )
         except Exception as e:
             console.print(f"[red]Error writing log: {e}[/red]")
 
