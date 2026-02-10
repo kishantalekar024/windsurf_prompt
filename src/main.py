@@ -9,7 +9,7 @@ from pathlib import Path
 from proxy_interceptor import create_proxy_server, CA_CERT_FILE
 from local_sniffer import LocalSniffer, check_sudo
 from config import Config
-from api import start_api_server_background
+from db import get_db
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -20,16 +20,14 @@ console = Console()
 class ProxyManager:
     """Main application manager for the Windsurf prompt interceptor"""
 
-    def __init__(self, debug: bool = False, enable_api: bool = False, api_port: int = 8000):
+    def __init__(self, debug: bool = False):
         self.server = None
         self.server_thread = None
         self.sniffer = None
-        self.api_thread = None
         self.running = False
         self.has_sudo = check_sudo()
         self.debug = debug
-        self.enable_api = enable_api
-        self.api_port = api_port
+        self.db = get_db()  # Initialize database connection
 
     def start_proxy(self):
         """Start the proxy server in a background thread."""
@@ -63,21 +61,11 @@ class ProxyManager:
             )
             return
 
-        self.sniffer = LocalSniffer(debug=self.debug)
+        self.sniffer = LocalSniffer(db=self.db, debug=self.debug)
         self.sniffer.start()
         debug_msg = " (debug mode)" if self.debug else ""
         console.print(f"[green]✓ Loopback sniffer started (capturing d.localhost traffic){debug_msg}[/green]")
 
-    def start_api_server(self):
-        """Start the API server for web access to prompts."""
-        if not self.enable_api:
-            return
-            
-        try:
-            self.api_thread = start_api_server_background(host="127.0.0.1", port=self.api_port)
-            console.print(f"[green]✓ API server started on http://127.0.0.1:{self.api_port}[/green]")
-        except Exception as e:
-            console.print(f"[yellow]⚠ Failed to start API server: {e}[/yellow]")
     def show_status_panel(self):
         """Display current status information"""
         status_text = Text()
@@ -85,11 +73,11 @@ class ProxyManager:
         status_text.append(f"Proxy Port: {Config.PROXY_PORT}\n", style="cyan")
         status_text.append(f"CA Cert: {CA_CERT_FILE}\n", style="cyan")
 
-        # Show API server status
-        if self.enable_api:
-            status_text.append(f"API Server: ✅ http://127.0.0.1:{self.api_port}\n", style="green")
+        # Show database status
+        if self.db.is_connected():
+            status_text.append("Database: ✅ MongoDB Connected\n", style="green")
         else:
-            status_text.append("API Server: ❌ Disabled (use --api to enable)\n", style="yellow")
+            status_text.append("Database: ❌ MongoDB Disconnected (logging to files)\n", style="yellow")
 
         # Show sniffer status
         if self.has_sudo:
@@ -122,10 +110,6 @@ class ProxyManager:
             status_text.append(
                 "⚡ For full capture: sudo python src/main.py\n", style="bold yellow"
             )
-        if self.enable_api:
-            status_text.append(
-                f"🌐 View prompts: http://127.0.0.1:{self.api_port}/prompts\n", style="green"
-            )
         status_text.append(
             "⚡ Open a new Windsurf via: ./launch_windsurf.sh\n", style="yellow"
         )
@@ -145,16 +129,16 @@ class ProxyManager:
                 "[bold green]Starting Windsurf Prompt Interceptor…[/bold green]"
             )
 
+            # Connect to database first
+            if not self.db.is_connected():
+                self.db.connect()
+
             # Start proxy (for HTTPS API traffic)
             self.start_proxy()
             time.sleep(0.5)
 
             # Start loopback sniffer (for local d.localhost traffic)
             self.start_sniffer()
-            time.sleep(0.5)
-
-            # Start API server (for web access to prompts)
-            self.start_api_server()
             time.sleep(0.5)
 
             self.running = True
@@ -184,6 +168,9 @@ class ProxyManager:
             if self.server:
                 self.server.shutdown()
 
+            if self.db:
+                self.db.close()
+
             console.print("[green]✓ Interceptor stopped[/green]")
 
         except Exception as e:
@@ -197,17 +184,6 @@ def main():
         "--debug", "-d", 
         action="store_true", 
         help="Enable debug logging for troubleshooting missed prompts"
-    )
-    parser.add_argument(
-        "--api",
-        action="store_true",
-        help="Start API server for web access to captured prompts"
-    )
-    parser.add_argument(
-        "--api-port",
-        type=int,
-        default=8000,
-        help="Port for API server (default: 8000)"
     )
     args = parser.parse_args()
 
@@ -223,12 +199,9 @@ def main():
     
     if args.debug:
         console.print("[yellow]🐛 Debug mode enabled - verbose logging active[/yellow]")
-        
-    if args.api:
-        console.print(f"[yellow]🌐 API server will start on port {args.api_port}[/yellow]")
 
     # Start the manager
-    manager = ProxyManager(debug=args.debug, enable_api=args.api, api_port=args.api_port)
+    manager = ProxyManager(debug=args.debug)
     manager.start()
 
 
