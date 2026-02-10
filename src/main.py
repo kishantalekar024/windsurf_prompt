@@ -6,7 +6,6 @@ import time
 import argparse
 from pathlib import Path
 
-from proxy_interceptor import create_proxy_server, CA_CERT_FILE
 from local_sniffer import LocalSniffer, check_sudo
 from config import Config
 from db import get_db
@@ -21,33 +20,11 @@ class ProxyManager:
     """Main application manager for the Windsurf prompt interceptor"""
 
     def __init__(self, debug: bool = False):
-        self.server = None
-        self.server_thread = None
         self.sniffer = None
         self.running = False
         self.has_sudo = check_sudo()
         self.debug = debug
         self.db = get_db()  # Initialize database connection
-
-    def start_proxy(self):
-        """Start the proxy server in a background thread."""
-        try:
-            self.server = create_proxy_server(Config.PROXY_PORT)
-
-            def run():
-                try:
-                    self.server.serve_forever()
-                except Exception as e:
-                    console.print(f"[red]Proxy error: {e}[/red]")
-
-            self.server_thread = threading.Thread(target=run, daemon=True)
-            self.server_thread.start()
-
-            console.print(f"[green]✓ Proxy started on port {Config.PROXY_PORT}[/green]")
-
-        except Exception as e:
-            console.print(f"[red]Failed to start proxy: {e}[/red]")
-            raise
 
     def start_sniffer(self):
         """Start the loopback sniffer for local Windsurf traffic."""
@@ -70,8 +47,6 @@ class ProxyManager:
         """Display current status information"""
         status_text = Text()
         status_text.append("🔍 Windsurf Prompt Interceptor\n\n", style="bold green")
-        status_text.append(f"Proxy Port: {Config.PROXY_PORT}\n", style="cyan")
-        status_text.append(f"CA Cert: {CA_CERT_FILE}\n", style="cyan")
 
         # Show database status
         if self.db.is_connected():
@@ -99,10 +74,6 @@ class ProxyManager:
         status_text.append(
             "🎯 Local prompts (d.localhost) → loopback sniffer (tcpdump)\n",
             style="green" if self.has_sudo else "yellow",
-        )
-        status_text.append(
-            "🔒 HTTPS AI APIs → MITM proxy (port {0})\n".format(Config.PROXY_PORT),
-            style="green",
         )
 
         status_text.append("\n📋 Usage:\n", style="bold yellow")
@@ -133,10 +104,6 @@ class ProxyManager:
             if not self.db.is_connected():
                 self.db.connect()
 
-            # Start proxy (for HTTPS API traffic)
-            self.start_proxy()
-            time.sleep(0.5)
-
             # Start loopback sniffer (for local d.localhost traffic)
             self.start_sniffer()
             time.sleep(0.5)
@@ -164,9 +131,6 @@ class ProxyManager:
 
             if self.sniffer:
                 self.sniffer.stop()
-
-            if self.server:
-                self.server.shutdown()
 
             if self.db:
                 self.db.close()

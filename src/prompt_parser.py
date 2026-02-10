@@ -200,65 +200,6 @@ class PromptParser:
             metadata=metadata,
         )
     
-    def extract_response(self, response_body: str) -> Optional[str]:
-        """Extract AI response from HTTP response"""
-        try:
-            if not response_body:
-                return None
-                
-            # Handle streaming responses (Server-Sent Events)
-            if response_body.startswith('data: '):
-                lines = response_body.split('\n')
-                response_text = ""
-                
-                for line in lines:
-                    if line.startswith('data: ') and line != 'data: [DONE]':
-                        try:
-                            chunk_data = json.loads(line[6:])  # Remove 'data: '
-                            
-                            # OpenAI streaming format
-                            choices = chunk_data.get('choices', [])
-                            if choices:
-                                delta = choices[0].get('delta', {})
-                                content = delta.get('content', '')
-                                response_text += content
-                                
-                        except json.JSONDecodeError:
-                            continue
-                
-                return response_text if response_text else None
-            
-            # Regular JSON response
-            else:
-                data = json.loads(response_body)
-                
-                # OpenAI format
-                if 'choices' in data:
-                    choices = data['choices']
-                    if choices:
-                        message = choices[0].get('message', {})
-                        return message.get('content', '')
-                
-                # Anthropic format
-                elif 'content' in data:
-                    content = data['content']
-                    if isinstance(content, list) and content:
-                        return content[0].get('text', '')
-                    elif isinstance(content, str):
-                        return content
-                
-                # Generic response field
-                elif 'response' in data:
-                    return data['response']
-                
-                return None
-                
-        except json.JSONDecodeError:
-            return None
-        except Exception as e:
-            console.print(f"[red]Error extracting response: {e}[/red]")
-            return None
-    
     def _detect_source(self, user_agent: str, url: str) -> str:
         """Detect the source application making the request"""
         user_agent_lower = user_agent.lower()
@@ -276,21 +217,3 @@ class PromptParser:
             return 'electron-app'
         else:
             return 'unknown'
-    
-    def should_log_request(self, prompt: InterceptedPrompt) -> bool:
-        """Determine if this prompt should be logged based on filters"""
-        # Skip empty prompts
-        if not prompt.prompt.strip():
-            return False
-        
-        # Skip very short prompts (likely autocomplete)
-        if len(prompt.prompt) < 10:
-            return False
-            
-        # Skip system/internal requests
-        system_patterns = ['health', 'ping', 'status', 'auth', 'token']
-        for pattern in system_patterns:
-            if pattern in prompt.url.lower():
-                return False
-        
-        return True

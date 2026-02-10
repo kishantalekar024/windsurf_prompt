@@ -1,222 +1,187 @@
 # Windsurf AI Prompt Interceptor
 
-A lightweight MITM proxy tool for capturing and viewing AI chat prompts from Windsurf and other Electron-based IDEs in real-time. Simple console output - no database required.
+A lightweight local traffic interceptor for capturing and analyzing AI chat prompts from Windsurf IDE in real-time. Features MongoDB storage, REST API access, and web dashboard integration.
 
-## 🚀 Features
+**Focus**: Local traffic capture only (no MITM proxy) - specifically designed for Windsurf's d.localhost communication pattern.
 
-- **Real-time MITM Interception**: Captures HTTPS traffic from Windsurf and other AI-enabled editors
-- **Console Output**: Beautiful formatted display of prompts and responses in terminal
-- **Smart Filtering**: Automatically detects and filters AI API calls (OpenAI, Anthropic, Codeium)
-- **Source Detection**: Identifies which application sent the prompt (Windsurf, VS Code, Cursor, etc.)
-- **Automatic SSL Setup**: Handles certificate installation and system proxy configuration
-- **Zero Configuration**: No database setup required - just install and run
+## 🌐  links
 
-## 📋 Requirements
+**Frontend Dashboard**: [Prompt Explorer](https://lovable.dev/projects/4a5d0f69-a5a2-422c-886f-939fe2f7e005?magic_link=mc_4d1bb855-3c58-4a1e-9973-f397f87bf127)  
+**Backend API**: [https://windsurf-prompt.onrender.com](https://windsurf-prompt.onrender.com)  
+**Source Code**: [Frontend Repository](https://github.com/kishantalekar024/prompt-explorer)
 
-- **macOS** (primary target, Linux/Windows support planned)
-- **Python 3.8+**
-- **Admin privileges** (for certificate and proxy setup)
 
-## 🛠️ Installation
+## 🚀 Quick Start
 
-### Super Quick Setup
+
+### Installation & Setup
 
 ```bash
-# Install dependencies
-pip install -r requirements-simple.txt
+# 1. Set up Python environment
+python -m venv venv
+source venv/bin/activate  # On macOS/Linux
+pip install -r requirements.txt
 
-# Start intercepting
-python src/main.py
+# 2. Install Node.js dependencies  
+npm install
+
+# 3. Start the interceptor (REQUIRED: sudo for traffic capture)
+sudo ./venv/bin/python src/main.py
+
+# 4. (Optional) Start the API server for web access
+node server.js
 ```
 
-### Alternative Setup
+## 📊 What You'll See
 
+### Console Output
+```
+🔍 Windsurf Prompt Interceptor
+
+✓ Connected to MongoDB: windsurf_prompts
+✓ Proxy started on port 8080
+✓ Loopback sniffer started (capturing d.localhost traffic)
+
+Database: ✅ MongoDB Connected
+Loopback Sniffer: ✅ Active (capturing local Windsurf traffic)
+
+================================================================================
+🎯 WINDSURF PROMPT CAPTURED  [14:58:41]  (local loopback)
+================================================================================
+  Model:          MODEL_SWE_1_5
+  Cascade ID:     52d2c626-dc2f-43b4-a1bf-8823623388f4
+  Planner Mode:   CONVERSATIONAL_PLANNER_MODE_DEFAULT
+  IDE:            Windsurf 1.9544.35
+  Extension:      v1.48.2
+  Brain:          ✅ Enabled
+
+  📝 PROMPT:
+  Create a React component for user authentication
+================================================================================
+```
+
+### API Access (Optional)
+If running the Node.js server:
 ```bash
-# Manual install if requirements file fails
-pip install mitmproxy requests rich colorama python-dotenv
+# Get recent prompts
+curl http://localhost:8000/prompts/latest?limit=5
 
-# Start intercepting
-python src/main.py
+# Get statistics  
+curl http://localhost:8000/prompts/stats
+
+# Check health
+curl http://localhost:8000/health
 ```
+
+## 🔍 Features
+
+The interceptor captures and stores:
+
+- **Windsurf Prompts**: Real-time capture of all AI chat interactions
+- **Complete Metadata**: Model, cascade ID, planner mode, IDE version, Brain status
+- **MongoDB Storage**: Persistent storage with fallback to JSON files
+- **REST API**: Access captured data via HTTP endpoints
+- **Web Dashboard**: Compatible with external dashboard applications
+- **Real-time Display**: Live console output with rich formatting
+
+## 🗄️ Data Storage
+
+### MongoDB (Recommended)
+- Automatic connection to configured MongoDB instance
+- Indexed for fast queries and analytics
+- Supports aggregation for statistics
+
+### File Fallback
+- JSONL files stored in `./logs/` directory
+- One file per day: `prompts_YYYY-MM-DD.jsonl`
+- Used when MongoDB is unavailable
+
+## 🌐 API Endpoints
+
+### Local Development
+When running `node server.js` locally:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /prompts` | Get captured prompts (paginated) |
+| `GET /prompts/latest` | Get most recent prompts |
+| `GET /prompts/count` | Get total prompt count |
+| `GET /prompts/stats` | Get aggregated statistics |
+| `GET /health` | Server and database health check |
+
+### Production API
+The live API is deployed at: **https://windsurf-prompt.onrender.com**
+
+**Example API calls:**
+```bash
+# Get latest prompts from production
+curl https://windsurf-prompt.onrender.com/prompts/latest?limit=5
+
+# Get statistics
+curl https://windsurf-prompt.onrender.com/prompts/stats
+
+# Check API health
+curl https://windsurf-prompt.onrender.com/health
+```
+
+### Dashboard Integration
+The [Prompt Explorer Dashboard](https://lovable.dev/projects/4a5d0f69-a5a2-422c-886f-939fe2f7e005?magic_link=mc_4d1bb855-3c58-4a1e-9973-f397f87bf127) automatically connects to the production API to display your captured prompts in a beautiful, interactive interface.
 
 ## ⚙️ Configuration
 
-Optional: Edit the `.env` file to customize:
+### Environment Variables
+- `MONGO_URI`: MongoDB connection string (shared between interceptor and API)
+- `PORT`: API server port (default: 8000)
 
-```env
-# Proxy Settings
-PROXY_PORT=8080
+### Dashboard Configuration
+The [frontend dashboard](https://github.com/kishantalekar024/prompt-explorer) is pre-configured to connect to:
+- **Production API**: `https://windsurf-prompt.onrender.com`
+- **Local API**: `http://localhost:8000` (when developing locally)
 
-# AI API Monitoring
-MONITOR_OPENAI=true
-MONITOR_ANTHROPIC=true
-MONITOR_CODEIUM=true
-MONITOR_ALL_AI_APIS=true
 
-# SSL Certificate
-AUTO_INSTALL_CERT=true
-```
 
-## 🚀 Usage
+### Troubleshooting
 
-### Starting the Interceptor
-
+**Permission Issues:**
 ```bash
-# Start intercepting
-python src/main.py
-
-# The system will:
-# 1. Install and trust the MITM certificate
-# 2. Configure system proxy settings
-# 3. Start capturing and printing AI traffic
+# Interceptor requires sudo for packet capture
+sudo ./venv/bin/python src/main.py
 ```
 
-### Using with Windsurf
-
-1. **Launch the interceptor** (as shown above)
-2. **Open Windsurf** - it will automatically use the system proxy
-3. **Start chatting** with Windsurf's AI features
-4. **Watch your terminal** - all prompts and responses will be displayed in real-time
-
-### What You'll See
-
-```
-================================================================================
-🔍 CAPTURED AI PROMPT
-================================================================================
-Source: windsurf
-Timestamp: 2026-02-09 19:45:30
-URL: https://api.openai.com/v1/chat/completions
-
-📝 PROMPT:
-Refactor this function to use async/await
-
-🤖 AI RESPONSE:
-Here's the refactored function using async/await...
-================================================================================
-```
-
-## � What Gets Captured
-
-The interceptor captures and displays:
-
-- **Prompt Text**: The actual question/request sent to AI
-- **AI Response**: The complete response from the AI service
-- **Source Application**: Which app sent the request (Windsurf, VS Code, etc.)
-- **API Details**: URL, method, timestamp
-- **Metadata**: Model name, parameters, etc.
-
-Everything is displayed in real-time in your terminal - no storage, no database, just live monitoring.
-
-## 🛡️ Security & Privacy
-
-### Important Considerations
-
-- **Data Sensitivity**: This tool captures AI prompts which may contain sensitive code/data
-- **No Storage**: All data is only displayed in terminal - nothing is saved
-- **HTTPS Interception**: Requires trusting a custom certificate authority
-- **System Proxy**: Temporarily modifies system network settings
-
-### Best Practices
-
-1. **Use only on your own machine** with your own accounts
-2. **Terminal output may contain sensitive info** - be aware of screen sharing
-3. **Disable when not needed** to avoid unnecessary interception
-4. **Press Ctrl+C to stop** and restore normal network settings
-
-## 🔍 Troubleshooting
-
-### Certificate Issues
-
-```bash
-# Manually install certificate
-sudo security add-trusted-cert -d -r trustRoot \
-  -k /Library/Keychains/System.keychain \
-  ~/.mitmproxy/mitmproxy-ca-cert.pem
-```
-
-### Proxy Not Working
-
+**Proxy Not Working:**
 ```bash
 # Check proxy settings
 networksetup -getwebproxy "Wi-Fi"
 networksetup -getsecurewebproxy "Wi-Fi"
 
-# Reset proxy settings
+# Reset proxy settings  
 networksetup -setwebproxystate "Wi-Fi" off
 networksetup -setsecurewebproxystate "Wi-Fi" off
 ```
 
-### No Output Showing
+**MongoDB Connection Issues:**
+- Check your `MONGO_URI` environment variable
+- Verify network connectivity
+- Interceptor will fall back to file logging automatically
 
-```bash
-# Check if mitmproxy is working
-ps aux | grep mitmproxy
+## 🏗️ Project Structure
 
-# Check proxy settings
-networksetup -getwebproxy "Wi-Fi"
+```
+windsurf-prompt/
+├── src/                    # Python interceptor core
+│   ├── main.py            # Main entry point  
+│   ├── proxy_interceptor.py  # MITM proxy server
+│   ├── local_sniffer.py   # Loopback traffic capture
+│   ├── db.py              # MongoDB interface
+│   └── api.py             # Database helpers
+├── server.js              # Node.js API server
+├── package.json           # Node.js dependencies
+├── requirements.txt       # Python dependencies
+└── logs/                  # JSON file storage (fallback)
 ```
 
-### Application Not Detected
 
-1. Check if Windsurf is using the system proxy
-2. Verify the AI API endpoints in the configuration
-3. Look for custom User-Agent patterns
-4. Check certificate trust settings
 
-## 🔮 Future Enhancements
-
-If you want more features later:
-
-- [ ] **Database storage** (re-enable the database code)
-- [ ] **Web dashboard** (re-enable the Flask server)
-- [ ] **Export functionality** (JSON, CSV, markdown)
-- [ ] **Advanced analytics** (prompt patterns, usage statistics)
-- [ ] **Cross-platform support** (Windows, Linux)
-
-### AI Provider Support
-
-- [x] OpenAI (GPT-3.5, GPT-4)
-- [x] Anthropic (Claude)  
-- [x] Codeium
-- [ ] GitHub Copilot
-- [ ] Google Bard/Gemini
-- [ ] Mistral AI
-- [ ] Local LLMs (Ollama, LM Studio)
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## ⚠️ Legal Notice
-
-This tool is for educational and debugging purposes only. Users must:
-
-- Only use on their own accounts and data
-- Comply with AI service Terms of Service
-- Respect privacy and data protection laws
-- Not use for unauthorized data collection
-
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-## 🆘 Support
-
-For questions, issues, or feature requests:
-
-- **GitHub Issues**: [Create an issue](https://github.com/your-repo/issues)
-- **Documentation**: Check this README and inline code comments
-- **Community**: Join discussions in GitHub Discussions
 
 ---
 
-**Happy prompt intercepting! 🔍✨**
-
-*Simple, lightweight, and effective network monitoring for your AI workflows.*
