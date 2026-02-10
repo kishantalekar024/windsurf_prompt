@@ -101,8 +101,10 @@ app.get('/', (req, res) => {
         version: '1.0.0',
         platform: 'Node.js',
         endpoints: {
-            'GET /prompts': 'Fetch captured prompts',
+            'GET /prompts': 'Fetch captured prompts (paginated)',
             'GET /prompts/latest': 'Get latest prompts',
+            'GET /prompts/count': 'Get total prompt count',
+            'GET /prompts/stats': 'Get aggregated statistics',
             'GET /health': 'Health check'
         }
     });
@@ -243,6 +245,182 @@ app.get('/prompts/latest', async (req, res) => {
     }
 });
 
+// Get prompt count
+app.get('/prompts/count', async (req, res) => {
+    try {
+        if (isConnected && collection) {
+            const count = await collection.countDocuments({});
+            res.json({
+                success: true,
+                count,
+                source: 'mongodb'
+            });
+        } else {
+            const prompts = readPromptsFromFiles();
+            res.json({
+                success: true,
+                count: prompts.length,
+                source: 'files'
+            });
+        }
+    } catch (error) {
+        console.error('Error counting prompts:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to count prompts',
+            message: error.message
+        });
+    }
+});
+
+// Get aggregated statistics
+app.get('/prompts/stats', async (req, res) => {
+    try {
+        if (isConnected && collection) {
+            // MongoDB aggregation
+            const pipeline = [
+                {
+                    $group: {
+                        _id: null,
+                        total_prompts: { $sum: 1 },
+                        unique_models: { $addToSet: '$metadata.model' },
+                        unique_sources: { $addToSet: '$source' },
+                        avg_prompt_length: { $avg: { $strLenCP: '$prompt' } },
+                        brain_enabled_count: {
+                            $sum: {
+                                $cond: [{ $eq: ['$metadata.brain_enabled', true] }, 1, 0]
+                            }
+                        },
+                        models: { $push: '$metadata.model' },
+                        planners: { $push: '$metadata.planner_mode' },
+                        hours: { $push: { $hour: '$timestamp' } }
+                    }
+                }
+            ];
+            
+            const result = await collection.aggregate(pipeline).toArray();
+            const stats = result[0] || {};
+            
+            // Process model usage
+            const modelUsage = {};
+            if (stats.models) {
+                stats.models.forEach(model => {
+                    if (model) {
+                        modelUsage[model] = (modelUsage[model] || 0) + 1;
+                    }
+                });
+            }
+            
+            // Process planner usage  
+            const plannerUsage = {};
+            if (stats.planners) {
+                stats.planners.forEach(planner => {
+                    if (planner) {
+                        plannerUsage[planner] = (plannerUsage[planner] || 0) + 1;
+                    }
+                });
+            }
+            
+            // Process hourly distribution
+            const hourlyDistribution = Array(24).fill(0);
+            if (stats.hours) {
+                stats.hours.forEach(hour => {
+                    if (typeof hour === 'number' && hour >= 0 && hour < 24) {
+                        hourlyDistribution[hour]++;
+                    }
+                });
+            }
+            
+            const responseStats = {
+                total_prompts: stats.total_prompts || 0,
+                unique_models: stats.unique_models ? stats.unique_models.length : 0,
+                unique_sources: stats.unique_sources ? stats.unique_sources.length : 0,
+                avg_prompt_length: Math.round(stats.avg_prompt_length || 0),
+                brain_enabled_percentage: stats.total_prompts > 0 
+                    ? Math.round((stats.brain_enabled_count / stats.total_prompts) * 100)
+                    : 0,
+                model_usage: modelUsage,
+                planner_usage: plannerUsage,
+                hourly_distribution: hourlyDistribution
+            };
+            
+            res.json({
+                success: true,
+                stats: responseStats,
+                source: 'mongodb'
+            });
+            
+        } else {
+            // Fallback to files
+            const prompts = readPromptsFromFiles();
+            
+            const modelUsage = {};
+            const plannerUsage = {};
+            const hourlyDistribution = Array(24).fill(0);
+            let brainEnabledCount = 0;
+            let totalPromptLength = 0;
+            
+            prompts.forEach(prompt => {
+                // Model usage
+                const model = prompt.metadata?.model;
+                if (model) {
+                    modelUsage[model] = (modelUsage[model] || 0) + 1;
+                }
+                
+                // Planner usage
+                const planner = prompt.metadata?.planner_mode;
+                if (planner) {
+                    plannerUsage[planner] = (plannerUsage[planner] || 0) + 1;
+                }
+                
+                // Brain enabled
+                if (prompt.metadata?.brain_enabled) {
+                    brainEnabledCount++;
+                }
+                
+                // Prompt length
+                if (prompt.prompt) {
+                    totalPromptLength += prompt.prompt.length;
+                }
+                
+                // Hourly distribution
+                if (prompt.timestamp) {
+                    const hour = new Date(prompt.timestamp).getHours();
+                    if (hour >= 0 && hour < 24) {
+                        hourlyDistribution[hour]++;
+                    }
+                }
+            });
+            
+            const responseStats = {
+                total_prompts: prompts.length,
+                unique_models: Object.keys(modelUsage).length,
+                unique_sources: [...new Set(prompts.map(p => p.source))].length,
+                avg_prompt_length: prompts.length > 0 ? Math.round(totalPromptLength / prompts.length) : 0,
+                brain_enabled_percentage: prompts.length > 0 
+                    ? Math.round((brainEnabledCount / prompts.length) * 100)
+                    : 0,
+                model_usage: modelUsage,
+                planner_usage: plannerUsage,
+                hourly_distribution: hourlyDistribution
+            };
+            
+            res.json({
+                success: true,
+                stats: responseStats,
+                source: 'files'
+            });
+        }
+    } catch (error) {
+        console.error('Error generating stats:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to generate stats',
+            message: error.message
+        });
+    }
+});
+
 // 404 handler
 app.use('*', (req, res) => {
     res.status(404).json({
@@ -298,6 +476,8 @@ async function startServer() {
         console.log(`📋 Endpoints:`);
         console.log(`   • GET /prompts - Fetch prompts (paginated)`);
         console.log(`   • GET /prompts/latest - Get latest prompts`);
+        console.log(`   • GET /prompts/count - Get total count`);
+        console.log(`   • GET /prompts/stats - Get statistics`);
         console.log(`   • GET /health - Health check`);
         console.log(`\n📁 Data sources:`);
         console.log(`   • MongoDB: ${isConnected ? '✅ Connected' : '❌ Disconnected'}`);
