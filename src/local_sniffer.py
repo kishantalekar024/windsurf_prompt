@@ -14,6 +14,7 @@ import threading
 import json
 import os
 import re
+import getpass
 from datetime import datetime
 from typing import Optional, Callable
 
@@ -674,7 +675,7 @@ class LocalSniffer:
                 meta = prompt.metadata or {}
                 self.db.save_prompt(
                     prompt_text=prompt.prompt,
-                    user="default_user",  # Hardcoded for now
+                    user=os.environ.get("SUDO_USER") or getpass.getuser(),
                     source=prompt.source,
                     model=meta.get("model", ""),
                     cascade_id=meta.get("cascade_id", ""),

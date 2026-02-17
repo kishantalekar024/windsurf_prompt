@@ -3,6 +3,7 @@ MongoDB database module for storing captured prompts.
 """
 
 import os
+import getpass
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from pymongo import MongoClient, DESCENDING
@@ -63,7 +64,7 @@ class PromptDB:
     def save_prompt(
         self,
         prompt_text: str,
-        user: str = "John Doe",
+        user: str = None,
         source: str = "windsurf",
         model: str = "",
         cascade_id: str = "",
@@ -106,7 +107,7 @@ class PromptDB:
             doc = {
                 # Core fields
                 "prompt": prompt_text,
-                "user": user,
+                "user": user or os.environ.get("SUDO_USER") or getpass.getuser(),
                 "source": source,
                 "timestamp": now,
 

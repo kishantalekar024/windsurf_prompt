@@ -41,14 +41,14 @@ async function connectToMongoDB() {
             serverSelectionTimeoutMS: 3000,
             connectTimeoutMS: 3000
         });
-        
+
         await mongoClient.connect();
         await mongoClient.db('admin').command({ ping: 1 });
-        
+
         db = mongoClient.db(DB_NAME);
         collection = db.collection(COLLECTION_NAME);
         isConnected = true;
-        
+
         console.log(`✓ Connected to MongoDB: ${DB_NAME}`);
         return true;
     } catch (error) {
@@ -62,21 +62,21 @@ async function connectToMongoDB() {
 function readPromptsFromFiles() {
     const prompts = [];
     const logsDir = path.join(__dirname, 'logs');
-    
+
     if (!fs.existsSync(logsDir)) {
         return prompts;
     }
-    
+
     try {
         const files = fs.readdirSync(logsDir)
             .filter(file => file.startsWith('prompts_') && file.endsWith('.jsonl'))
             .sort()
             .reverse(); // Newest first
-        
+
         for (const file of files) {
             const filePath = path.join(logsDir, file);
             const content = fs.readFileSync(filePath, 'utf-8');
-            
+
             const lines = content.split('\n').filter(line => line.trim());
             for (const line of lines) {
                 try {
@@ -90,7 +90,7 @@ function readPromptsFromFiles() {
     } catch (error) {
         console.error('Error reading JSONL files:', error.message);
     }
-    
+
     return prompts;
 }
 
@@ -123,7 +123,7 @@ app.get('/prompts', async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 50, 500);
         const skip = parseInt(req.query.skip) || 0;
-        
+
         if (isConnected && collection) {
             // Fetch from MongoDB
             const prompts = await collection
@@ -138,12 +138,13 @@ app.get('/prompts', async (req, res) => {
                     'metadata.cascade_id': 1,
                     'metadata.planner_mode': 1,
                     'metadata.brain_enabled': 1,
-                    source: 1
+                    source: 1,
+                    user: 1
                 })
                 .toArray();
-            
+
             const total = await collection.countDocuments({});
-            
+
             res.json({
                 success: true,
                 prompts,
@@ -168,9 +169,10 @@ app.get('/prompts', async (req, res) => {
                         planner_mode: p.metadata?.planner_mode,
                         brain_enabled: p.metadata?.brain_enabled
                     },
-                    source: p.source
+                    source: p.source,
+                    user: p.user
                 }));
-            
+
             res.json({
                 success: true,
                 prompts,
@@ -195,7 +197,7 @@ app.get('/prompts', async (req, res) => {
 app.get('/prompts/latest', async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 10, 50);
-        
+
         if (isConnected && collection) {
             const prompts = await collection
                 .find({})
@@ -205,10 +207,11 @@ app.get('/prompts/latest', async (req, res) => {
                     timestamp: 1,
                     prompt: 1,
                     'metadata.model': 1,
-                    'metadata.cascade_id': 1
+                    'metadata.cascade_id': 1,
+                    user: 1
                 })
                 .toArray();
-            
+
             res.json({
                 success: true,
                 prompts,
@@ -225,9 +228,10 @@ app.get('/prompts/latest', async (req, res) => {
                     metadata: {
                         model: p.metadata?.model,
                         cascade_id: p.metadata?.cascade_id
-                    }
+                    },
+                    user: p.user
                 }));
-            
+
             res.json({
                 success: true,
                 prompts,
@@ -297,10 +301,10 @@ app.get('/prompts/stats', async (req, res) => {
                     }
                 }
             ];
-            
+
             const result = await collection.aggregate(pipeline).toArray();
             const stats = result[0] || {};
-            
+
             // Process model usage
             const modelUsage = {};
             if (stats.models) {
@@ -310,7 +314,7 @@ app.get('/prompts/stats', async (req, res) => {
                     }
                 });
             }
-            
+
             // Process planner usage  
             const plannerUsage = {};
             if (stats.planners) {
@@ -320,7 +324,7 @@ app.get('/prompts/stats', async (req, res) => {
                     }
                 });
             }
-            
+
             // Process hourly distribution
             const hourlyDistribution = Array(24).fill(0);
             if (stats.hours) {
@@ -330,59 +334,59 @@ app.get('/prompts/stats', async (req, res) => {
                     }
                 });
             }
-            
+
             const responseStats = {
                 total_prompts: stats.total_prompts || 0,
                 unique_models: stats.unique_models ? stats.unique_models.length : 0,
                 unique_sources: stats.unique_sources ? stats.unique_sources.length : 0,
                 avg_prompt_length: Math.round(stats.avg_prompt_length || 0),
-                brain_enabled_percentage: stats.total_prompts > 0 
+                brain_enabled_percentage: stats.total_prompts > 0
                     ? Math.round((stats.brain_enabled_count / stats.total_prompts) * 100)
                     : 0,
                 model_usage: modelUsage,
                 planner_usage: plannerUsage,
                 hourly_distribution: hourlyDistribution
             };
-            
+
             res.json({
                 success: true,
                 stats: responseStats,
                 source: 'mongodb'
             });
-            
+
         } else {
             // Fallback to files
             const prompts = readPromptsFromFiles();
-            
+
             const modelUsage = {};
             const plannerUsage = {};
             const hourlyDistribution = Array(24).fill(0);
             let brainEnabledCount = 0;
             let totalPromptLength = 0;
-            
+
             prompts.forEach(prompt => {
                 // Model usage
                 const model = prompt.metadata?.model;
                 if (model) {
                     modelUsage[model] = (modelUsage[model] || 0) + 1;
                 }
-                
+
                 // Planner usage
                 const planner = prompt.metadata?.planner_mode;
                 if (planner) {
                     plannerUsage[planner] = (plannerUsage[planner] || 0) + 1;
                 }
-                
+
                 // Brain enabled
                 if (prompt.metadata?.brain_enabled) {
                     brainEnabledCount++;
                 }
-                
+
                 // Prompt length
                 if (prompt.prompt) {
                     totalPromptLength += prompt.prompt.length;
                 }
-                
+
                 // Hourly distribution
                 if (prompt.timestamp) {
                     const hour = new Date(prompt.timestamp).getHours();
@@ -391,20 +395,20 @@ app.get('/prompts/stats', async (req, res) => {
                     }
                 }
             });
-            
+
             const responseStats = {
                 total_prompts: prompts.length,
                 unique_models: Object.keys(modelUsage).length,
                 unique_sources: [...new Set(prompts.map(p => p.source))].length,
                 avg_prompt_length: prompts.length > 0 ? Math.round(totalPromptLength / prompts.length) : 0,
-                brain_enabled_percentage: prompts.length > 0 
+                brain_enabled_percentage: prompts.length > 0
                     ? Math.round((brainEnabledCount / prompts.length) * 100)
                     : 0,
                 model_usage: modelUsage,
                 planner_usage: plannerUsage,
                 hourly_distribution: hourlyDistribution
             };
-            
+
             res.json({
                 success: true,
                 stats: responseStats,
@@ -441,33 +445,33 @@ app.use((error, req, res, next) => {
 // Graceful shutdown
 process.on('SIGINT', async () => {
     console.log('\n⚠ Received SIGINT, shutting down gracefully...');
-    
+
     if (mongoClient) {
         await mongoClient.close();
         console.log('✓ MongoDB connection closed');
     }
-    
+
     process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
     console.log('\n⚠ Received SIGTERM, shutting down gracefully...');
-    
+
     if (mongoClient) {
         await mongoClient.close();
         console.log('✓ MongoDB connection closed');
     }
-    
+
     process.exit(0);
 });
 
 // Start server
 async function startServer() {
     console.log('🚀 Starting Windsurf Prompts Fetcher (Node.js)...\n');
-    
+
     // Try to connect to MongoDB
     await connectToMongoDB();
-    
+
     app.listen(PORT, '0.0.0.0', () => {
         console.log('\n' + '='.repeat(60));
         console.log('📥 Windsurf Prompts Fetcher (Node.js)');
