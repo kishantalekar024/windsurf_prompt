@@ -105,6 +105,7 @@ app.get('/', (req, res) => {
             'GET /prompts/latest': 'Get latest prompts',
             'GET /prompts/count': 'Get total prompt count',
             'GET /prompts/stats': 'Get aggregated statistics',
+            'GET /prompts/models': 'Get available models',
             'GET /health': 'Health check'
         }
     });
@@ -123,11 +124,26 @@ app.get('/prompts', async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 50, 500);
         const skip = parseInt(req.query.skip) || 0;
+        
+        // Build filter object
+        const filters = {};
+        const { user, model, prompt: promptText, from, to } = req.query;
+        
+        if (user) filters.user = { $regex: user, $options: 'i' };
+        if (model) filters['metadata.model'] = model;
+        if (promptText) filters.prompt = { $regex: promptText, $options: 'i' };
+        
+        // Date range filtering
+        if (from || to) {
+            filters.timestamp = {};
+            if (from) filters.timestamp.$gte = new Date(from);
+            if (to) filters.timestamp.$lte = new Date(to);
+        }
 
         if (isConnected && collection) {
             // Fetch from MongoDB
             const prompts = await collection
-                .find({})
+                .find(filters)
                 .sort({ timestamp: -1 })
                 .skip(skip)
                 .limit(limit)
@@ -143,7 +159,7 @@ app.get('/prompts', async (req, res) => {
                 })
                 .toArray();
 
-            const total = await collection.countDocuments({});
+            const total = await collection.countDocuments(filters);
 
             res.json({
                 success: true,
@@ -152,11 +168,34 @@ app.get('/prompts', async (req, res) => {
                 limit,
                 skip,
                 returned: prompts.length,
-                source: 'mongodb'
+                source: 'mongodb',
+                filters: filters
             });
         } else {
-            // Fallback to files
-            const allPrompts = readPromptsFromFiles();
+            // Fallback to files with filtering
+            let allPrompts = readPromptsFromFiles();
+            
+            // Apply filters to file data
+            if (user) {
+                const userRegex = new RegExp(user, 'i');
+                allPrompts = allPrompts.filter(p => userRegex.test(p.user));
+            }
+            if (model) {
+                allPrompts = allPrompts.filter(p => p.metadata?.model === model);
+            }
+            if (promptText) {
+                const regex = new RegExp(promptText, 'i');
+                allPrompts = allPrompts.filter(p => regex.test(p.prompt));
+            }
+            if (from || to) {
+                allPrompts = allPrompts.filter(p => {
+                    const timestamp = new Date(p.timestamp);
+                    if (from && timestamp < new Date(from)) return false;
+                    if (to && timestamp > new Date(to)) return false;
+                    return true;
+                });
+            }
+            
             const total = allPrompts.length;
             const prompts = allPrompts
                 .slice(skip, skip + limit)
@@ -180,7 +219,8 @@ app.get('/prompts', async (req, res) => {
                 limit,
                 skip,
                 returned: prompts.length,
-                source: 'files'
+                source: 'files',
+                filters: { user, model, prompt: promptText, from, to }
             });
         }
     } catch (error) {
@@ -272,6 +312,80 @@ app.get('/prompts/count', async (req, res) => {
         res.status(500).json({
             success: false,
             error: 'Failed to count prompts',
+            message: error.message
+        });
+    }
+});
+
+// Get available models
+app.get('/prompts/models', async (req, res) => {
+    try {
+        if (isConnected && collection) {
+            // Fetch from MongoDB
+            const models = await collection.distinct('metadata.model');
+            const modelStats = await collection.aggregate([
+                {
+                    $group: {
+                        _id: '$metadata.model',
+                        count: { $sum: 1 },
+                        last_used: { $max: '$timestamp' }
+                    }
+                },
+                {
+                    $project: {
+                        _id: 0,
+                        model: '$_id',
+                        count: 1,
+                        last_used: 1
+                    }
+                },
+                { $sort: { count: -1 } }
+            ]).toArray();
+
+            res.json({
+                success: true,
+                models: models.filter(m => m), // Filter out null/undefined
+                model_stats: modelStats,
+                total_models: models.filter(m => m).length,
+                source: 'mongodb'
+            });
+        } else {
+            // Fallback to files
+            const allPrompts = readPromptsFromFiles();
+            const modelCounts = {};
+            const modelLastUsed = {};
+            
+            allPrompts.forEach(prompt => {
+                const model = prompt.metadata?.model;
+                if (model) {
+                    modelCounts[model] = (modelCounts[model] || 0) + 1;
+                    const timestamp = new Date(prompt.timestamp);
+                    if (!modelLastUsed[model] || timestamp > modelLastUsed[model]) {
+                        modelLastUsed[model] = timestamp;
+                    }
+                }
+            });
+            
+            const models = Object.keys(modelCounts);
+            const modelStats = models.map(model => ({
+                model,
+                count: modelCounts[model],
+                last_used: modelLastUsed[model]
+            })).sort((a, b) => b.count - a.count);
+
+            res.json({
+                success: true,
+                models,
+                model_stats: modelStats,
+                total_models: models.length,
+                source: 'files'
+            });
+        }
+    } catch (error) {
+        console.error('Error fetching models:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch models',
             message: error.message
         });
     }
@@ -482,6 +596,7 @@ async function startServer() {
         console.log(`   • GET /prompts/latest - Get latest prompts`);
         console.log(`   • GET /prompts/count - Get total count`);
         console.log(`   • GET /prompts/stats - Get statistics`);
+        console.log(`   • GET /prompts/models - Get available models`);
         console.log(`   • GET /health - Health check`);
         console.log(`\n📁 Data sources:`);
         console.log(`   • MongoDB: ${isConnected ? '✅ Connected' : '❌ Disconnected'}`);
